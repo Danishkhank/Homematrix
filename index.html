@@ -937,9 +937,11 @@ function render(){
 }
 
 // Hidden admin entry points: direct hash/query or Ctrl+Shift+A. Nothing is visible in the public UI.
+const ADMIN_REQUESTED = window.location.hash==='#control-center' || new URLSearchParams(window.location.search).get('admin')==='1';
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.shiftKey && e.key.toLowerCase()==='a'){ e.preventDefault(); openAdmin(); } });
-if(window.location.hash==='#control-center' || new URLSearchParams(window.location.search).get('admin')==='1'){ openAdmin(); }
-initMembers();
+// Preserve the hidden admin request while the normal member session is restored.
+if(ADMIN_REQUESTED){ state.screen='admin-login'; }
+initMembers().then(()=>{ if(ADMIN_REQUESTED) openAdmin(); });
 render();
 </script>
 </body>
