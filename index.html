@@ -16,6 +16,7 @@
 <!-- Firebase -->
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 
 <style>
 :root{
@@ -256,20 +257,27 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
+const auth = firebase.auth();
 
 /* =========================================================
-   MEMBERS — the 3 registered nodes
+   MEMBER REGISTRY
+   Members are stored in Firebase RTDB so Admin can add/update them.
+   Protect writes with the adminUsers rule described in firebase-rules.json.
    ========================================================= */
-const MEMBERS = [
-  { id:"danish",   name:"Danish Khan",   phone:"8445971997", pin:"4545" },
-  { id:"faiz",     name:"Faiz Khan",     phone:"9720128879", pin:"3333" },
-  { id:"meherban", name:"Meherban Khan", phone:"8650356401", pin:"2222" }
+const DEFAULT_MEMBERS = [
+  { id:"danish",   name:"Danish Khan",   phone:"8445971997", pin:"4545", active:true },
+  { id:"faiz",     name:"Faiz Khan",     phone:"9720128879", pin:"3333", active:true },
+  { id:"meherban", name:"Meherban Khan", phone:"8650356401", pin:"2222", active:true }
 ];
+let MEMBERS = [];
 const ROOM_ID = "27644";
 
 let state = {
   screen: "login",
   currentUser: null,
+  membersReady: false,
+  adminError: "",
+  editingMemberId: null,
   expenses: [],
   settlements: [],
   loading: true,
@@ -291,12 +299,13 @@ function fmtDate(ts){
   return d.toLocaleDateString("en-GB") + ", " + d.toLocaleTimeString("en-GB");
 }
 function memberById(id){ return MEMBERS.find(m=>m.id===id); }
-function otherMembers(id){ return MEMBERS.filter(m=>m.id!==id); }
+function activeMembers(){ return MEMBERS.filter(m=>m.active!==false); }
+function otherMembers(id){ return activeMembers().filter(m=>m.id!==id); }
 
 function calcBalances(){
-  const totals = {}; MEMBERS.forEach(m=>totals[m.id]={paid:0, owed:0, sentConfirmed:0, receivedConfirmed:0});
+  const totals = {}; activeMembers().forEach(m=>totals[m.id]={paid:0, owed:0, sentConfirmed:0, receivedConfirmed:0});
   state.expenses.forEach(e=>{
-    const participants = (e.participants && e.participants.length) ? e.participants : MEMBERS.map(m=>m.id);
+    const participants = (e.participants && e.participants.length) ? e.participants : activeMembers().map(m=>m.id);
     const share = Number(e.amount) / participants.length;
     if(totals[e.payerId]) totals[e.payerId].paid += Number(e.amount);
     participants.forEach(pid=>{ if(totals[pid]) totals[pid].owed += share; });
@@ -307,7 +316,7 @@ function calcBalances(){
   });
   const opening = (state.meta && state.meta.openingBalance) ? state.meta.openingBalance : {};
   const net = {};
-  MEMBERS.forEach(m=>{
+  activeMembers().forEach(m=>{
     const t = totals[m.id];
     net[m.id] = Number(opening[m.id]||0) + (t.paid - t.owed) + t.sentConfirmed - t.receivedConfirmed;
   });
@@ -315,7 +324,22 @@ function calcBalances(){
 }
 
 /* ---------------- Realtime Database live sync ---------------- */
-let expensesRef=null, settlementsRef=null, metaRef=null;
+let membersRef=null, expensesRef=null, settlementsRef=null, metaRef=null;
+function startMemberSync(){
+  if(membersRef) return;
+  membersRef=db.ref('rooms/'+ROOM_ID+'/members');
+  membersRef.on('value', snap=>{
+    const val=snap.val()||{};
+    MEMBERS=Object.keys(val).map(id=>({id,...val[id]}));
+    state.membersReady=true;
+    if(state.currentUser){
+      const fresh=memberById(state.currentUser.id);
+      if(!fresh || fresh.active===false){ logout(); return; }
+      state.currentUser=fresh;
+    }
+    render();
+  }, err=>console.error(err));
+}
 function startSync(){
   expensesRef = db.ref("rooms/"+ROOM_ID+"/expenses");
   expensesRef.on("value", snap=>{
@@ -355,22 +379,47 @@ async function confirmSettlement(settlementId){
   });
 }
 
-/* ---------------- Login ---------------- */
-function tryLogin(phone, pin){
-  const m = MEMBERS.find(x=>x.phone===phone.trim() && x.pin===pin.trim());
-  if(!m){ state.loginError = "Node not recognised. Check phone + PIN."; render(); return; }
-  state.currentUser = m; state.loginError=""; state.screen="grid";
+/* ---------------- Member registry + Login ---------------- */
+async function refreshMembers(){
+  const snap=await db.ref('rooms/'+ROOM_ID+'/members').once('value');
+  const val=snap.val()||{};
+  MEMBERS=Object.keys(val).map(id=>({id,...val[id]}));
+  state.membersReady=true;
+  return MEMBERS;
+}
+async function initMembers(){
+  try{
+    const snap=await db.ref('rooms/'+ROOM_ID+'/members').once('value');
+    if(!snap.exists()){
+      const payload={};
+      DEFAULT_MEMBERS.forEach(m=>payload[m.id]=m);
+      await db.ref('rooms/'+ROOM_ID+'/members').set(payload);
+      MEMBERS=DEFAULT_MEMBERS.slice();
+    }else{
+      MEMBERS=Object.keys(snap.val()||{}).map(id=>({id,...snap.val()[id]}));
+    }
+    state.membersReady=true;
+  }catch(err){ console.error(err); state.membersReady=true; MEMBERS=DEFAULT_MEMBERS.slice(); state.loginError="Member registry sync failed."; }
+  startMemberSync();
+  tryRestoreSession();
+  render();
+}
+async function tryLogin(phone, pin){
+  if(!state.membersReady){ state.loginError="Member registry is still syncing..."; render(); return; }
+  const m=activeMembers().find(x=>x.phone===phone.trim() && x.pin===pin.trim());
+  if(!m){ state.loginError="Node not recognised. Check phone + PIN."; render(); return; }
+  state.currentUser=m; state.loginError=""; state.screen="grid";
   localStorage.setItem("nexus_session", m.id);
   startSync(); render();
 }
 function tryRestoreSession(){
-  const id = localStorage.getItem("nexus_session");
-  if(id){ const m = memberById(id); if(m){ state.currentUser=m; state.screen="grid"; startSync(); } }
+  const id=localStorage.getItem("nexus_session");
+  if(id){ const m=activeMembers().find(x=>x.id===id); if(m){ state.currentUser=m; state.screen="grid"; startSync(); } }
 }
 function logout(){
   stopSync(); localStorage.removeItem("nexus_session");
   state = { screen:"login", currentUser:null, expenses:[], settlements:[], loading:true, loginError:"", settleTarget:null,
-    tempDesc:"", tempAmount:"", tempSettleAmount:"", tempPayer:null, tempParticipants:null, meta:null };
+    tempDesc:"", tempAmount:"", tempSettleAmount:"", tempPayer:null, tempParticipants:null, meta:null, membersReady:true, adminError:"", editingMemberId:null };
   render();
 }
 
@@ -388,23 +437,29 @@ const ICON = {
 
 /* ---------------- Mesh Pulse SVG ---------------- */
 function meshSVG(highlightEdge){
-  // triangle layout
-  const pts = {danish:[75,115], faiz:[275,30], meherban:[275,200]};
-  const idsInOrder = MEMBERS.map(m=>m.id);
-  const edges = [["danish","faiz"],["faiz","meherban"],["meherban","danish"]];
-  const me = state.currentUser ? state.currentUser.id : null;
-  let svg = `<svg viewBox="0 0 350 230" preserveAspectRatio="xMidYMid meet">`;
-  edges.forEach(([a,b])=>{
-    const active = highlightEdge && ((highlightEdge[0]===a&&highlightEdge[1]===b)||(highlightEdge[0]===b&&highlightEdge[1]===a));
-    svg += `<line class="${active?'mesh-edge-active':'mesh-edge'}" x1="${pts[a][0]}" y1="${pts[a][1]}" x2="${pts[b][0]}" y2="${pts[b][1]}"/>`;
+  const nodes = activeMembers();
+  if(!nodes.length) return `<svg viewBox="0 0 350 230"></svg>`;
+  const cx=175, cy=115, rx=118, ry=82;
+  const pts={};
+  nodes.forEach((m,i)=>{
+    const a=(-Math.PI/2) + (i/nodes.length)*Math.PI*2;
+    pts[m.id]=[cx+Math.cos(a)*rx, cy+Math.sin(a)*ry];
   });
-  idsInOrder.forEach((id,i)=>{
-    const [x,y]=pts[id]; const isMe = id===me;
-    svg += `<circle class="mesh-node-dot ${isMe?'me':''}" cx="${x}" cy="${y}" r="${isMe?9:6.5}" style="animation-delay:${i*.4}s"/>`;
+  let svg = `<svg viewBox="0 0 350 230" preserveAspectRatio="xMidYMid meet">`;
+  if(nodes.length > 1){
+    for(let i=0;i<nodes.length;i++){
+      const a=nodes[i].id, b=nodes[(i+1)%nodes.length].id;
+      const active = highlightEdge && ((highlightEdge[0]===a&&highlightEdge[1]===b)||(highlightEdge[0]===b&&highlightEdge[1]===a));
+      svg += `<line class="${active?'mesh-edge-active':'mesh-edge'}" x1="${pts[a][0]}" y1="${pts[a][1]}" x2="${pts[b][0]}" y2="${pts[b][1]}"/>`;
+    }
+  }
+  const me = state.currentUser ? state.currentUser.id : null;
+  nodes.forEach((m,i)=>{
+    const [x,y]=pts[m.id], isMe=m.id===me;
+    svg += `<circle class="mesh-node-dot ${isMe?'me':''}" cx="${x}" cy="${y}" r="${isMe?9:6.5}" style="animation-delay:${i*.2}s"/>`;
     if(isMe) svg += `<circle class="mesh-pulse-core" cx="${x}" cy="${y}" r="3"/>`;
-    const label = memberById(id).name.split(" ")[0];
-    const dy = id==="danish" ? 24 : (id==="faiz" ? -14 : 24);
-    svg += `<text class="mesh-label ${isMe?'me':''}" x="${x}" y="${y+dy}">${label.toUpperCase()}</text>`;
+    const dy = y < cy ? -14 : 24;
+    svg += `<text class="mesh-label ${isMe?'me':''}" x="${x}" y="${y+dy}">${String(m.name||'').split(' ')[0].toUpperCase()}</text>`;
   });
   svg += `</svg>`;
   return svg;
@@ -412,11 +467,12 @@ function meshSVG(highlightEdge){
 
 /* ---------------- Screens ---------------- */
 function renderLogin(){
+  const count = activeMembers().length;
   return `
   <div class="login-wrap">
     <div class="login-eyebrow">Secure Access Terminal</div>
     <div class="login-title"><span class="l1">NEXUS</span><span class="l2">LEDGER</span></div>
-    <div class="room-tag">ROOM_ID :: ${ROOM_ID} &nbsp;·&nbsp; 3-NODE MESH</div>
+    <div class="room-tag">ROOM_ID :: ${ROOM_ID} &nbsp;·&nbsp; ${count}-NODE MESH</div>
     <div class="login-panel">
       <div class="login-hint">
         ${ICON.fingerprint}
@@ -431,12 +487,12 @@ function renderLogin(){
       </div>
       <div class="field">
         <label>Security PIN</label>
-        <input id="loginPin" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autocomplete="off">
+        <input id="loginPin" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autocomplete="off" onkeydown="if(event.key==='Enter') handleLoginClick()">
       </div>
       <button class="primary-btn" onclick="handleLoginClick()">${ICON.bolt} ENTER THE MATRIX</button>
       <div class="error-msg">${state.loginError}</div>
     </div>
-    <div class="footnote">Only 3 registered nodes may access this ledger.</div>
+    <div class="footnote">Only ${count} active node${count===1?'':'s'} may access this ledger.</div>
     <div class="node-mini-mesh">${meshSVG(null)}</div>
   </div>`;
 }
@@ -523,7 +579,7 @@ function renderGrid(){
 
 function renderExpense(){
   const payerId = state.currentUser.id;
-  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : MEMBERS.map(m=>m.id);
+  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : activeMembers().map(m=>m.id);
   const amt = Number(state.tempAmount || 0);
   const shareVal = participants.length ? amt / participants.length : 0;
   const isTwoWay = participants.length < MEMBERS.length;
@@ -589,7 +645,7 @@ function renderSettle(){
 }
 
 function buildLogText(e){
-  const participants = (e.participants && e.participants.length) ? e.participants : MEMBERS.map(m=>m.id);
+  const participants = (e.participants && e.participants.length) ? e.participants : activeMembers().map(m=>m.id);
   const share = Number(e.amount) / participants.length;
   if(participants.length >= MEMBERS.length){
     return `<b>${memberById(e.payerId).name}</b> added <span class="amt-inline">${fmt(e.amount)}</span> for ${e.description}. Individual split of ${fmt(share)} written across room vectors.`;
@@ -651,7 +707,7 @@ function renderSec(){
     <div class="panel">
       <div class="panel-eyebrow">Session</div>
       <div class="sec-row"><div class="lbl">Room ID</div><div class="val">${ROOM_ID}</div></div>
-      <div class="sec-row"><div class="lbl">Mesh Size</div><div class="val">3 Nodes</div></div>
+      <div class="sec-row"><div class="lbl">Mesh Size</div><div class="val">${activeMembers().length} Nodes</div></div>
       <div class="sec-row"><div class="lbl">Auth Method</div><div class="val">Phone + PIN</div></div>
       <div class="sec-row"><div class="lbl">Sync</div><div class="val" style="color:var(--mint);">● Live</div></div>
     </div>
@@ -661,10 +717,131 @@ function renderSec(){
     ${renderNav()}`;
 }
 
+
+/* ---------------- Hidden Admin ---------------- */
+function openAdmin(){
+  state.adminError="";
+  state.screen = auth.currentUser ? "admin" : "admin-login";
+  render();
+}
+function closeAdmin(){
+  state.adminError="";
+  state.screen = state.currentUser ? "grid" : "login";
+  render();
+}
+async function handleAdminLoginClick(){
+  const email=(document.getElementById('adminEmail')?.value||'').trim();
+  const pass=(document.getElementById('adminPassword')?.value||'');
+  if(!email || !pass){ state.adminError="Email aur password dono required hain."; render(); return; }
+  try{
+    const cred=await auth.signInWithEmailAndPassword(email,pass);
+    const snap=await db.ref('adminUsers/'+cred.user.uid).once('value');
+    if(snap.val()!==true){ await auth.signOut(); state.adminError="This account is not authorised as admin."; render(); return; }
+    state.adminError=""; state.screen="admin"; render();
+  }catch(err){ console.error(err); state.adminError="Admin login failed. Check credentials."; render(); }
+}
+async function adminLogout(){ try{ await auth.signOut(); } finally { closeAdmin(); } }
+function slugId(name){
+  const base=(name||'member').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,28) || 'member';
+  return base+'-'+Date.now().toString(36);
+}
+function adminEditMember(id){
+  const m=memberById(id); if(!m) return;
+  state.editingMemberId=id; state.adminError=""; render();
+  setTimeout(()=>{
+    ['adminName','adminPhone','adminPin'].forEach(id=>{ const el=document.getElementById(id); if(el) el.focus(); });
+  },30);
+}
+function adminCancelEdit(){ state.editingMemberId=null; state.adminError=""; render(); }
+function adminFocusNew(){ const el=document.getElementById('adminName'); if(el) el.focus(); }
+async function adminSaveMember(){
+  const name=(document.getElementById('adminName')?.value||'').trim();
+  const phone=(document.getElementById('adminPhone')?.value||'').replace(/\D/g,'');
+  const pin=(document.getElementById('adminPin')?.value||'').trim();
+  const active=document.getElementById('adminActive')?.checked ?? true;
+  if(name.length<2){ state.adminError="Valid member name daalo."; render(); return; }
+  if(phone.length!==10){ state.adminError="10 digit mobile number required hai."; render(); return; }
+  if(pin.length!==4 || !/^\d{4}$/.test(pin)){ state.adminError="PIN exactly 4 digits ka hona chahiye."; render(); return; }
+  const duplicate=activeMembers().find(m=>m.phone===phone && m.id!==state.editingMemberId);
+  if(duplicate){ state.adminError="Ye phone number already registered hai."; render(); return; }
+  try{
+    if(state.editingMemberId){
+      await db.ref('rooms/'+ROOM_ID+'/members/'+state.editingMemberId).update({name,phone,pin,active});
+    }else{
+      const id=slugId(name);
+      await db.ref('rooms/'+ROOM_ID+'/members/'+id).set({name,phone,pin,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP});
+    }
+    await refreshMembers();
+    state.editingMemberId=null; state.adminError=""; render();
+  }catch(err){ console.error(err); state.adminError="Member save nahi hua. Firebase rules check karo."; render(); }
+}
+async function adminToggleMember(id){
+  const m=memberById(id); if(!m) return;
+  const next=m.active===false;
+  if(!next && activeMembers().length===0){};
+  try{ await db.ref('rooms/'+ROOM_ID+'/members/'+id).update({active:next}); await refreshMembers(); render(); }
+  catch(err){ console.error(err); state.adminError="Status update failed. Firebase rules check karo."; render(); }
+}
+function renderAdminLogin(){
+  return `
+    <div class="login-wrap">
+      <div class="login-eyebrow">Restricted Control Channel</div>
+      <div class="login-title"><span class="l1">ADMIN</span><span class="l2">CONTROL</span></div>
+      <div class="room-tag">ROOM_ID :: ${ROOM_ID} &nbsp;·&nbsp; PRIVILEGED ACCESS</div>
+      <div class="login-panel">
+        <div class="login-hint">${ICON.sec}<div><div class="t1">Administrator</div><div class="t2">Firebase Auth required</div></div></div>
+        <div class="field"><label>Admin Email</label><input id="adminEmail" type="email" placeholder="admin@example.com" autocomplete="username"></div>
+        <div class="field"><label>Password</label><input id="adminPassword" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <button class="primary-btn amber" onclick="handleAdminLoginClick()">${ICON.sec} UNLOCK CONTROL</button>
+        <div class="error-msg">${state.adminError}</div>
+      </div>
+      <div class="footnote">This control channel has no public navigation entry.</div>
+      <button class="exit-btn" style="margin-top:18px;" onclick="closeAdmin()">RETURN</button>
+    </div>`;
+}
+function renderAdmin(){
+  const editing=state.editingMemberId ? memberById(state.editingMemberId) : null;
+  const members=MEMBERS.slice().sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+  return `
+    <div class="admin-panel">
+      <div class="topbar">
+        <div><div class="eyebrow">Restricted Control</div><h1>Admin Panel</h1></div>
+        <button class="exit-btn" onclick="adminLogout()">${ICON.send} LOCK</button>
+      </div>
+      <div class="panel accent">
+        <span class="admin-badge">● ${activeMembers().length} ACTIVE / ${MEMBERS.length} TOTAL</span>
+        <h2 style="margin-top:14px;">${editing?'Edit Member':'Add New Member'}</h2>
+        <div class="admin-form-grid">
+          <div class="field wide"><label>Member Name</label><input id="adminName" class="small" value="${editing?String(editing.name).replace(/&/g,'&amp;').replace(/"/g,'&quot;'):''}" placeholder="Full Name"></div>
+          <div class="field"><label>Phone Number</label><input id="adminPhone" class="small" type="tel" inputmode="numeric" maxlength="10" value="${editing?editing.phone:''}" placeholder="10 digit mobile"></div>
+          <div class="field"><label>4-Digit PIN</label><input id="adminPin" class="small" type="password" inputmode="numeric" maxlength="4" value="${editing?editing.pin:''}" placeholder="••••"></div>
+          ${editing?`<div class="field wide"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text-mid);"><input id="adminActive" type="checkbox" ${editing.active!==false?'checked':''} style="width:auto;"> Active member</label></div>`:''}
+        </div>
+        <div class="admin-actions">
+          <button class="warn" onclick="adminSaveMember()">${editing?'SAVE CHANGES':'ADD MEMBER'}</button>
+          <button onclick="${editing?'adminCancelEdit()':'adminFocusNew()'}">${editing?'CANCEL':'NEW ENTRY'}</button>
+        </div>
+        <div class="error-msg">${state.adminError}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-eyebrow">Member Registry</div>
+        <h2>All Members</h2>
+        <div class="admin-list">
+          ${members.map(m=>`<div class="admin-member">
+            <div class="row1"><div class="node-dot-sm" style="background:${m.active===false?'var(--coral)':'var(--mint)'}"></div><div class="name">${m.name}</div><span class="admin-status ${m.active===false?'off':'on'}">${m.active===false?'Inactive':'Active'}</span></div>
+            <div class="meta">Phone: ${m.phone}<br>PIN: •••• &nbsp;·&nbsp; ID: ${m.id}</div>
+            <div class="admin-actions"><button onclick="adminEditMember('${m.id}')">EDIT</button><button class="warn" onclick="adminToggleMember('${m.id}')">${m.active===false?'ACTIVATE':'DEACTIVATE'}</button></div>
+          </div>`).join('') || '<div class="empty-state">No members registered.</div>'}
+        </div>
+      </div>
+      <div class="panel"><div class="warn-box" style="margin:0;"><span class="lbl">Security Note</span>Admin access is intentionally hidden from the public navigation. Actual protection comes from Firebase Authentication + the <b>adminUsers</b> database rule.</div></div>
+    </div>`;
+}
+
 /* ---------------- Router / render ---------------- */
 function go(screen){ state.screen = screen; render(); }
 function toggleParticipant(id){
-  let participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : MEMBERS.map(m=>m.id);
+  let participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : activeMembers().map(m=>m.id);
   if(participants.includes(id)) participants = participants.filter(x=>x!==id);
   else participants = [...participants, id];
   if(participants.length===0) participants=[state.currentUser.id];
@@ -675,7 +852,7 @@ function selectSettleTarget(id){ state.settleTarget = id; render(); }
 
 function updateExpensePreview(){
   const amt = Number(document.getElementById('expAmount').value || 0);
-  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : MEMBERS.map(m=>m.id);
+  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : activeMembers().map(m=>m.id);
   const el = document.getElementById('sharePreview');
   if(el) el.textContent = fmt(participants.length ? amt/participants.length : 0);
 }
@@ -684,7 +861,7 @@ async function handleAddExpense(){
   const desc = (state.tempDesc||"").trim();
   const amt = Number(state.tempAmount);
   const payerId = state.currentUser.id;
-  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : MEMBERS.map(m=>m.id);
+  const participants = (state.tempParticipants && state.tempParticipants.length) ? state.tempParticipants : activeMembers().map(m=>m.id);
   if(!desc || !amt || amt<=0){ alert("Description aur valid amount daalo."); return; }
   await addExpense(desc, amt, payerId, participants);
   state.tempDesc=""; state.tempAmount=""; state.tempParticipants=null;
@@ -714,7 +891,11 @@ function handleLoginClick(){
 function render(){
   const root = document.getElementById('root');
   let html = `<div class="app">`;
-  if(state.screen==="login" || !state.currentUser){
+  if(state.screen==="admin-login"){
+    html += renderAdminLogin();
+  } else if(state.screen==="admin"){
+    html += renderAdmin();
+  } else if(state.screen==="login" || !state.currentUser){
     html += renderLogin();
   } else if(state.loading){
     html += renderTopbar() + `<div class="panel"><div class="empty-state">Syncing ledger...</div></div>`;
@@ -732,7 +913,11 @@ function render(){
   root.innerHTML = html;
 }
 
-tryRestoreSession();
+// Hidden admin entry points: direct hash/query or Ctrl+Shift+A. Nothing is visible in the public UI.
+document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.shiftKey && e.key.toLowerCase()==='a'){ e.preventDefault(); openAdmin(); } });
+if(window.location.hash==='#control-center' || new URLSearchParams(window.location.search).get('admin')==='1'){ openAdmin(); }
+auth.onAuthStateChanged(user=>{ if(!user && state.screen==='admin'){ state.screen=state.currentUser?'grid':'login'; render(); } });
+initMembers();
 render();
 </script>
 </body>
