@@ -16,7 +16,6 @@
 <!-- Firebase -->
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 
 <style>
 :root{
@@ -236,6 +235,25 @@ input:focus, button:focus{outline:none;}
   .bal-card .amt{font-size:16px;}
   .login-title .l1, .login-title .l2{font-size:38px;}
 }
+
+/* ---------- Hidden Admin Panel ---------- */
+.admin-panel{padding-bottom:30px;}
+.admin-badge{display:inline-block; font-size:10px; letter-spacing:.12em; color:var(--mint); border:1px solid var(--border); border-radius:99px; padding:7px 10px; background:rgba(45,255,176,.05);}
+.admin-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;}
+.admin-form-grid .wide{grid-column:1/-1;}
+.admin-actions{display:flex;gap:10px;margin-top:12px;}
+.admin-actions button{flex:1;padding:12px;border-radius:11px;border:1px solid var(--border-soft);background:rgba(255,255,255,.02);color:var(--text-mid);font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.06em;cursor:pointer;}
+.admin-actions button.warn{border-color:var(--amber);color:var(--amber);background:rgba(255,176,32,.06);}
+.admin-list{display:flex;flex-direction:column;}
+.admin-member{padding:16px 0;border-top:1px solid var(--border-soft);}
+.admin-member:first-child{border-top:none;padding-top:4px;}
+.admin-member .row1{display:flex;align-items:center;gap:9px;}
+.admin-member .name{font-size:15px;color:var(--text);font-weight:600;flex:1;}
+.admin-member .meta{font-size:10.5px;color:var(--text-dim);line-height:1.7;margin:8px 0 2px 17px;}
+.admin-status{font-size:9px;letter-spacing:.1em;text-transform:uppercase;}
+.admin-status.on{color:var(--mint);}
+.admin-status.off{color:var(--coral);}
+@media(max-width:420px){.admin-form-grid{grid-template-columns:1fr;}.admin-form-grid .wide{grid-column:auto;}}
 </style>
 </head>
 <body>
@@ -257,7 +275,6 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
-const auth = firebase.auth();
 
 /* =========================================================
    MEMBER REGISTRY
@@ -271,6 +288,10 @@ const DEFAULT_MEMBERS = [
 ];
 let MEMBERS = [];
 const ROOM_ID = "27644";
+
+/* Hidden Admin Access — intentionally not shown anywhere in public UI. */
+const ADMIN_PHONE = "8445971997";
+const ADMIN_PIN = "4827";
 
 let state = {
   screen: "login",
@@ -721,26 +742,30 @@ function renderSec(){
 /* ---------------- Hidden Admin ---------------- */
 function openAdmin(){
   state.adminError="";
-  state.screen = auth.currentUser ? "admin" : "admin-login";
+  state.screen = sessionStorage.getItem("nexus_admin_session")==="1" ? "admin" : "admin-login";
   render();
 }
 function closeAdmin(){
+  sessionStorage.removeItem("nexus_admin_session");
   state.adminError="";
+  state.editingMemberId=null;
   state.screen = state.currentUser ? "grid" : "login";
   render();
 }
-async function handleAdminLoginClick(){
-  const email=(document.getElementById('adminEmail')?.value||'').trim();
-  const pass=(document.getElementById('adminPassword')?.value||'');
-  if(!email || !pass){ state.adminError="Email aur password dono required hain."; render(); return; }
-  try{
-    const cred=await auth.signInWithEmailAndPassword(email,pass);
-    const snap=await db.ref('adminUsers/'+cred.user.uid).once('value');
-    if(snap.val()!==true){ await auth.signOut(); state.adminError="This account is not authorised as admin."; render(); return; }
-    state.adminError=""; state.screen="admin"; render();
-  }catch(err){ console.error(err); state.adminError="Admin login failed. Check credentials."; render(); }
+function handleAdminLoginClick(){
+  const phone=(document.getElementById('adminPhoneLogin')?.value||'').replace(/\D/g,'');
+  const pin=(document.getElementById('adminPinLogin')?.value||'').trim();
+  if(phone===ADMIN_PHONE && pin===ADMIN_PIN){
+    sessionStorage.setItem("nexus_admin_session","1");
+    state.adminError="";
+    state.screen="admin";
+    render();
+  }else{
+    state.adminError="Admin phone number ya PIN galat hai.";
+    render();
+  }
 }
-async function adminLogout(){ try{ await auth.signOut(); } finally { closeAdmin(); } }
+function adminLogout(){ closeAdmin(); }
 function slugId(name){
   const base=(name||'member').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,28) || 'member';
   return base+'-'+Date.now().toString(36);
@@ -748,9 +773,7 @@ function slugId(name){
 function adminEditMember(id){
   const m=memberById(id); if(!m) return;
   state.editingMemberId=id; state.adminError=""; render();
-  setTimeout(()=>{
-    ['adminName','adminPhone','adminPin'].forEach(id=>{ const el=document.getElementById(id); if(el) el.focus(); });
-  },30);
+  setTimeout(()=>{ const el=document.getElementById('adminName'); if(el) el.focus(); },30);
 }
 function adminCancelEdit(){ state.editingMemberId=null; state.adminError=""; render(); }
 function adminFocusNew(){ const el=document.getElementById('adminName'); if(el) el.focus(); }
@@ -768,19 +791,19 @@ async function adminSaveMember(){
     if(state.editingMemberId){
       await db.ref('rooms/'+ROOM_ID+'/members/'+state.editingMemberId).update({name,phone,pin,active});
     }else{
-      const id=slugId(name);
+      let id=slugId(name);
+      while(memberById(id)) id=slugId(name);
       await db.ref('rooms/'+ROOM_ID+'/members/'+id).set({name,phone,pin,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP});
     }
     await refreshMembers();
     state.editingMemberId=null; state.adminError=""; render();
-  }catch(err){ console.error(err); state.adminError="Member save nahi hua. Firebase rules check karo."; render(); }
+  }catch(err){ console.error(err); state.adminError="Member save nahi hua. Firebase database write permission check karo."; render(); }
 }
 async function adminToggleMember(id){
   const m=memberById(id); if(!m) return;
   const next=m.active===false;
-  if(!next && activeMembers().length===0){};
   try{ await db.ref('rooms/'+ROOM_ID+'/members/'+id).update({active:next}); await refreshMembers(); render(); }
-  catch(err){ console.error(err); state.adminError="Status update failed. Firebase rules check karo."; render(); }
+  catch(err){ console.error(err); state.adminError="Status update failed. Firebase database write permission check karo."; render(); }
 }
 function renderAdminLogin(){
   return `
@@ -789,9 +812,9 @@ function renderAdminLogin(){
       <div class="login-title"><span class="l1">ADMIN</span><span class="l2">CONTROL</span></div>
       <div class="room-tag">ROOM_ID :: ${ROOM_ID} &nbsp;·&nbsp; PRIVILEGED ACCESS</div>
       <div class="login-panel">
-        <div class="login-hint">${ICON.sec}<div><div class="t1">Administrator</div><div class="t2">Firebase Auth required</div></div></div>
-        <div class="field"><label>Admin Email</label><input id="adminEmail" type="email" placeholder="admin@example.com" autocomplete="username"></div>
-        <div class="field"><label>Password</label><input id="adminPassword" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <div class="login-hint">${ICON.sec}<div><div class="t1">Administrator</div><div class="t2">Phone + PIN handshake</div></div></div>
+        <div class="field"><label>Admin Phone Number</label><input id="adminPhoneLogin" type="tel" inputmode="numeric" maxlength="10" placeholder="10 digit mobile" autocomplete="off"></div>
+        <div class="field"><label>Admin PIN</label><input id="adminPinLogin" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autocomplete="off"></div>
         <button class="primary-btn amber" onclick="handleAdminLoginClick()">${ICON.sec} UNLOCK CONTROL</button>
         <div class="error-msg">${state.adminError}</div>
       </div>
@@ -916,7 +939,6 @@ function render(){
 // Hidden admin entry points: direct hash/query or Ctrl+Shift+A. Nothing is visible in the public UI.
 document.addEventListener('keydown', e=>{ if(e.ctrlKey && e.shiftKey && e.key.toLowerCase()==='a'){ e.preventDefault(); openAdmin(); } });
 if(window.location.hash==='#control-center' || new URLSearchParams(window.location.search).get('admin')==='1'){ openAdmin(); }
-auth.onAuthStateChanged(user=>{ if(!user && state.screen==='admin'){ state.screen=state.currentUser?'grid':'login'; render(); } });
 initMembers();
 render();
 </script>
